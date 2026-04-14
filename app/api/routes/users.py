@@ -7,36 +7,9 @@ Role-restricted endpoints use require_roles().
 
 from __future__ import annotations
 
-import time
-from typing import Any
+from fastapi import APIRouter, Depends, Query, status
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from saleshub_core.repositories.user import (
-    check_email_exists,
-    check_email_exists_excluding,
-    check_phone_exists,
-    check_phone_variations_excluding,
-    check_username_exists,
-    check_username_exists_excluding,
-    count_other_company_admins,
-    deactivate_user,
-    execute_count_users,
-    execute_list_users,
-    get_user_by_id,
-    get_user_by_username,
-    get_user_for_delete,
-    get_user_for_suspend,
-    get_user_permissions,
-    insert_user,
-    soft_delete_user,
-    update_user_fields,
-    update_user_password,
-    update_user_status,
-)
-
-from app.api.deps import TokenPayload, get_db_session, require_auth, require_roles
+from app.api.deps import TokenPayload, get_user_service, require_auth, require_roles
 from app.schemas.user import (
     ChangePasswordRequest,
     UserCreateRequest,
@@ -46,40 +19,11 @@ from app.schemas.user import (
     UserStatusRequest,
     UserUpdateRequest,
 )
+from app.services.user_service import UserService
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 _ADMIN_ROLES = ("company_admin", "super_admin")
-
-
-def _row_to_user(row: Any) -> UserResponse:
-    return UserResponse(
-        user_id=str(row["user_id"]),
-        user_num=row.get("user_num"),
-        username=row["username"],
-        first_name=row.get("first_name"),
-        last_name=row.get("last_name"),
-        created_time=row.get("created_time"),
-        status=row.get("status"),
-        company=row.get("company"),
-        company_id=str(row["company_id"]) if row.get("company_id") else None,
-        tenant_id=str(row["tenant_id"]) if row.get("tenant_id") else None,
-        tenant_name=row.get("tenant_name"),
-        image=row.get("image"),
-        role_id=str(row["role_id"]) if row.get("role_id") else None,
-        role=row.get("role"),
-        email=row.get("email"),
-        phone=row.get("phone"),
-        email_verified=row.get("email_verified"),
-        phone_verified=row.get("phone_verified"),
-        email_last_verified=row.get("email_last_verified"),
-        phone_last_verified=row.get("phone_last_verified"),
-        affiliate=row.get("affiliate"),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -89,14 +33,11 @@ def _row_to_user(row: Any) -> UserResponse:
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_user(
     user_id: str,
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_auth),
 ) -> UserResponse:
     """Return a full user profile joined with tenant."""
-    row = await get_user_by_id(session, user_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-    return _row_to_user(row)
+    return await svc.get_user(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +52,7 @@ async def list_users(
     status_filter: str | None = Query(None, alias="status"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_auth),
 ) -> UserListResponse:
     """
@@ -122,72 +63,14 @@ async def list_users(
     - **search**: partial match on username / name / email / phone
     - **status**: filter by status (active, suspended, inactive)
     """
-    conditions = ["u.del_flg = false"]
-    params: dict[str, Any] = {}
-
-    if company_id:
-        conditions.append("u.company_id = :company_id")
-        params["company_id"] = company_id
-
-    if role:
-        conditions.append("LOWER(u.role) = LOWER(:role)")
-        params["role"] = role
-
-    if status_filter:
-        conditions.append("u.status = :status")
-        params["status"] = status_filter
-
-    if search:
-        conditions.append(
-            "(u.username ILIKE :search OR u.first_name ILIKE :search "
-            "OR u.last_name ILIKE :search OR u.email ILIKE :search "
-            "OR u.phone ILIKE :search)"
-        )
-        params["search"] = f"%{search}%"
-
-    where_clause = " AND ".join(conditions)
-    offset = (page - 1) * page_size
-
-    select_query = f"""
-        SELECT
-            u.user_id, u.user_num, u.username, u.first_name, u.last_name,
-            u.created_time, u.status, u.company, u.company_id, u.tenant_id,
-            t.tenant_name, u.image, u.role_id, u.role, u.email, u.phone,
-            u.email_verified, u.phone_verified, u.email_last_verified,
-            u.phone_last_verified, u.affiliate
-        FROM users u
-        LEFT JOIN tenant t ON u.tenant_id = t.tenant_id
-        WHERE {where_clause}
-        ORDER BY u.user_num
-        LIMIT :limit OFFSET :offset
-    """
-    count_query = f"SELECT COUNT(*) AS total FROM users u WHERE {where_clause}"
-
-    params["limit"] = page_size
-    params["offset"] = offset
-
-    rows, count_row = await _execute_list_and_count(
-        session, select_query, count_query, params
-    )
-
-    return UserListResponse(
-        total=count_row["total"],
+    return await svc.list_users(
+        company_id=company_id,
+        role=role,
+        search=search,
+        status_filter=status_filter,
         page=page,
         page_size=page_size,
-        items=[_row_to_user(r) for r in rows],
     )
-
-
-async def _execute_list_and_count(
-    session: AsyncSession,
-    select_query: str,
-    count_query: str,
-    params: dict[str, Any],
-) -> tuple[list[Any], Any]:
-    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
-    rows = await execute_list_users(session, select_query, params)
-    count_row = await execute_count_users(session, count_query, count_params)
-    return rows, count_row
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +80,7 @@ async def _execute_list_and_count(
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     body: UserCreateRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_roles(*_ADMIN_ROLES)),
 ) -> UserResponse:
     """
@@ -207,53 +90,7 @@ async def create_user(
     - Password is stored as a pgcrypto hash via ``crypt(:password, gen_salt('bf'))``.
     - Requires **company_admin** or **super_admin** role.
     """
-    normalized_username = body.username.lower().strip()
-
-    if await check_username_exists(session, normalized_username):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Username '{body.username}' is already taken.",
-        )
-
-    if body.email and await check_email_exists(session, body.email):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Email '{body.email}' is already registered.",
-        )
-
-    if body.phone and await check_phone_exists(session, body.phone):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Phone '{body.phone}' is already registered.",
-        )
-
-    # Hash password using pgcrypto via raw SQL in insert_user
-    hashed_password = f"crypt('{body.password}', gen_salt('bf'))"
-
-    row = await insert_user(
-        session,
-        username=normalized_username,
-        password=hashed_password,
-        first_name=body.first_name,
-        last_name=body.last_name,
-        created_time=int(time.time()),
-        status=body.status,
-        company=body.company,
-        company_id=body.company_id,
-        tenant_id=body.tenant_id,
-        image=body.image,
-        role_id=body.role_id,
-        role=body.role,
-        email=body.email,
-        phone=body.phone,
-        email_verified=body.email_verified,
-        phone_verified=body.phone_verified,
-        email_last_verified=None,
-        phone_last_verified=None,
-        affiliate=body.affiliate,
-    )
-    await session.commit()
-    return _row_to_user(row)
+    return await svc.create_user(body)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +101,7 @@ async def create_user(
 async def update_user(
     user_id: str,
     body: UserUpdateRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_auth),
 ) -> UserResponse:
     """
@@ -273,44 +110,7 @@ async def update_user(
     Only non-None fields in the request body are applied.
     Uniqueness is re-checked for username, email, and phone when provided.
     """
-    update_data = body.model_dump(exclude_none=True)
-    if not update_data:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No fields provided to update.",
-        )
-
-    if "username" in update_data:
-        if await check_username_exists_excluding(session, update_data["username"], user_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Username '{update_data['username']}' is already taken.",
-            )
-
-    if "email" in update_data:
-        if await check_email_exists_excluding(session, update_data["email"], user_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Email '{update_data['email']}' is already registered.",
-            )
-
-    if "phone" in update_data:
-        if await check_phone_variations_excluding(session, [update_data["phone"]], user_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Phone '{update_data['phone']}' is already registered.",
-            )
-
-    update_fields = [f"{col} = :{col}" for col in update_data]
-    params = {**update_data, "user_id": user_id}
-
-    await update_user_fields(session, update_fields, params)
-    await session.commit()
-
-    row = await get_user_by_id(session, user_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-    return _row_to_user(row)
+    return await svc.update_user(user_id, body)
 
 
 # ---------------------------------------------------------------------------
@@ -320,58 +120,21 @@ async def update_user(
 @router.post("/{user_id}/suspend", response_model=UserResponse)
 async def suspend_user(
     user_id: str,
-    session: AsyncSession = Depends(get_db_session),
-    payload: TokenPayload = Depends(require_roles(*_ADMIN_ROLES)),
+    svc: UserService = Depends(get_user_service),
+    _: TokenPayload = Depends(require_roles(*_ADMIN_ROLES)),
 ) -> UserResponse:
     """Suspend a user account. Requires admin role."""
-    row = await get_user_for_suspend(session, user_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-
-    if row["status"] == "suspended":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User is already suspended.",
-        )
-
-    # Prevent suspending the last company admin
-    if row["role"].lower() in ("company_admin", "company admin"):
-        count_row = await count_other_company_admins(session, row["company_id"], user_id)
-        if count_row and count_row["remaining_count"] == 0:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Cannot suspend the last company admin.",
-            )
-
-    await update_user_status(session, user_id, "suspended")
-    await session.commit()
-
-    updated = await get_user_by_id(session, user_id)
-    return _row_to_user(updated)
+    return await svc.suspend_user(user_id)
 
 
 @router.post("/{user_id}/unsuspend", response_model=UserResponse)
 async def unsuspend_user(
     user_id: str,
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_roles(*_ADMIN_ROLES)),
 ) -> UserResponse:
     """Restore a suspended user account. Requires admin role."""
-    row = await get_user_for_suspend(session, user_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-
-    if row["status"] != "suspended":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User is not suspended.",
-        )
-
-    await update_user_status(session, user_id, "active")
-    await session.commit()
-
-    updated = await get_user_by_id(session, user_id)
-    return _row_to_user(updated)
+    return await svc.unsuspend_user(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -382,19 +145,11 @@ async def unsuspend_user(
 async def set_user_status(
     user_id: str,
     body: UserStatusRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_roles(*_ADMIN_ROLES)),
 ) -> UserResponse:
     """Set an arbitrary status on a user (active, suspended, inactive)."""
-    row = await get_user_for_suspend(session, user_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-
-    await update_user_status(session, user_id, body.status)
-    await session.commit()
-
-    updated = await get_user_by_id(session, user_id)
-    return _row_to_user(updated)
+    return await svc.set_user_status(user_id, body.status)
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +160,7 @@ async def set_user_status(
 async def change_password(
     user_id: str,
     body: ChangePasswordRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_auth),
 ) -> None:
     """
@@ -414,17 +169,7 @@ async def change_password(
     Looks up the user by username to verify it belongs to the given user_id,
     then stores the new password hash via pgcrypto.
     """
-    row = await get_user_by_username(session, body.username)
-    if row is None or str(row["user_id"]) != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found.",
-        )
-
-    # Hash the new password through PostgreSQL pgcrypto
-    hashed = f"crypt('{body.new_password}', gen_salt('bf'))"
-    await update_user_password(session, user_id, hashed)
-    await session.commit()
+    await svc.change_password(user_id, body)
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +179,8 @@ async def change_password(
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
     user_id: str,
-    session: AsyncSession = Depends(get_db_session),
-    payload: TokenPayload = Depends(require_roles(*_ADMIN_ROLES)),
+    svc: UserService = Depends(get_user_service),
+    _: TokenPayload = Depends(require_roles(*_ADMIN_ROLES)),
 ) -> None:
     """
     Soft-delete a user (sets ``del_flg = true``).
@@ -443,20 +188,7 @@ async def delete_user(
     Prevents deleting the last company admin.
     Requires **company_admin** or **super_admin** role.
     """
-    row = await get_user_for_delete(session, user_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-
-    if row["role"].lower() in ("company_admin", "company admin"):
-        count_row = await count_other_company_admins(session, row["company_id"], user_id)
-        if count_row and count_row["remaining_count"] == 0:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Cannot delete the last company admin.",
-            )
-
-    await soft_delete_user(session, user_id)
-    await session.commit()
+    await svc.delete_user(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -466,12 +198,8 @@ async def delete_user(
 @router.get("/{user_id}/permissions", response_model=UserPermissionsResponse)
 async def get_permissions(
     user_id: str,
-    session: AsyncSession = Depends(get_db_session),
+    svc: UserService = Depends(get_user_service),
     _: TokenPayload = Depends(require_auth),
 ) -> UserPermissionsResponse:
     """Return all permission names for a user via their assigned role."""
-    rows = await get_user_permissions(session, user_id)
-    return UserPermissionsResponse(
-        user_id=user_id,
-        permissions=[r["permission_name"] for r in rows],
-    )
+    return await svc.get_permissions(user_id)

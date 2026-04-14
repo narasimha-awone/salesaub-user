@@ -12,15 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, Request
 
-from saleshub_core.repositories.user import authenticate_user
-
-from app.api.deps import get_db_session, require_session_for_logout
+from app.api.deps import get_auth_service, require_session_for_logout
 from app.auth import extract_bearer_token
-from app.handlers import phone_otp as phone_otp_handler
-from app.handlers import user as user_handler
 from app.schemas.phone_otp import SendOTPRequest, SendOTPResponse, VerifyOTPRequest, VerifyOTPResponse
 from app.schemas.user import (
     LoginRequest,
@@ -31,6 +26,7 @@ from app.schemas.user import (
     UserChangePasswordResponse,
     UserLogoutResponse,
 )
+from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -42,54 +38,15 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 @router.post("/login", response_model=LoginResponse, summary="Login User")
 async def login(
     payload: LoginRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: AuthService = Depends(get_auth_service),
 ) -> LoginResponse:
     """
     Authenticate a user with username + password.
 
     Password validation is delegated to PostgreSQL's pgcrypto ``crypt()`` function.
     Returns the full user profile on success; raises **401** on bad credentials.
-
-    The ``X-Forwarded-For`` header is preferred for client IP when behind a proxy.
     """
-    row = await authenticate_user(session, payload.username, payload.password)
-    if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password.",
-        )
-
-    user_status = (row.get("status") or "").lower().strip()
-    if user_status == "inactive":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account has been inactive. Please contact your administrator.",
-        )
-    if user_status != "active":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Your account is currently {row['status']}. Please contact your administrator.",
-        )
-
-    return LoginResponse(
-        user_id=str(row["user_id"]),
-        username=row["username"],
-        first_name=row.get("first_name"),
-        last_name=row.get("last_name"),
-        email=row.get("email"),
-        phone=row.get("phone"),
-        role=row.get("role"),
-        role_id=str(row["role_id"]) if row.get("role_id") else None,
-        company_id=str(row["company_id"]) if row.get("company_id") else None,
-        company=row.get("company"),
-        tenant_id=str(row["tenant_id"]) if row.get("tenant_id") else None,
-        tenant_name=row.get("tenant_name"),
-        image=row.get("image"),
-        status=row.get("status"),
-        affiliate=row.get("affiliate"),
-        first_login=row.get("first_login"),
-        is_internal=row.get("is_internal"),
-    )
+    return await svc.login(payload.username, payload.password)
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +66,11 @@ async def login(
 async def select_campaign(
     request: Request,
     payload: SelectCampaignRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: AuthService = Depends(get_auth_service),
 ) -> SelectCampaignResponse:
     """Select a campaign and receive a full access token."""
     temporary_token = extract_bearer_token(request)
-    return await user_handler.select_campaign(session, payload, temporary_token)
+    return await svc.select_campaign(payload, temporary_token)
 
 
 # ---------------------------------------------------------------------------
@@ -128,10 +85,10 @@ async def select_campaign(
 )
 async def change_password(
     payload: UserChangePasswordRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: AuthService = Depends(get_auth_service),
 ) -> UserChangePasswordResponse:
     """Change a user's password."""
-    return await user_handler.change_password(session, payload)
+    return await svc.change_password(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -146,10 +103,10 @@ async def change_password(
 )
 async def send_phone_otp(
     payload: SendOTPRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: AuthService = Depends(get_auth_service),
 ) -> SendOTPResponse:
     """Send an OTP to the phone number for verification."""
-    return await phone_otp_handler.send_phone_otp(session, payload)
+    return await svc.send_phone_otp(payload)
 
 
 @router.post(
@@ -160,10 +117,10 @@ async def send_phone_otp(
 )
 async def verify_phone_otp(
     payload: VerifyOTPRequest,
-    session: AsyncSession = Depends(get_db_session),
+    svc: AuthService = Depends(get_auth_service),
 ) -> VerifyOTPResponse:
     """Verify the OTP and mark phone as verified."""
-    return await phone_otp_handler.verify_phone_otp(session, payload)
+    return await svc.verify_phone_otp(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +138,10 @@ async def verify_phone_otp(
 )
 async def logout_user(
     session_info: dict[str, Any] = Depends(require_session_for_logout),
-    session: AsyncSession = Depends(get_db_session),
+    svc: AuthService = Depends(get_auth_service),
 ) -> UserLogoutResponse:
     """Logout and close the active session."""
-    return await user_handler.logout_user(
-        session,
+    return await svc.logout_user(
         login_id=session_info["login_id"],
         login_start_time=session_info["login_start_time"],
     )

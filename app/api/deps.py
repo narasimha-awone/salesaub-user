@@ -16,6 +16,8 @@ from saleshub_core.auth.schemas import TokenPayload
 from saleshub_core.database import get_db_session
 
 from app.auth import decode_access_token, extract_bearer_token
+from app.services.auth_service import AuthService
+from app.services.user_service import UserService
 
 __all__ = [
     "get_db_session",
@@ -23,6 +25,8 @@ __all__ = [
     "require_roles",
     "require_session_for_logout",
     "TokenPayload",
+    "get_user_service",
+    "get_auth_service",
 ]
 
 
@@ -77,3 +81,11 @@ async def require_session_for_logout(
         )
 
     return {"login_id": login["login_id"], "login_start_time": login["login_start_time"]}
+
+
+def get_user_service(session: AsyncSession = Depends(get_db_session)) -> UserService:
+    return UserService(session)
+
+
+def get_auth_service(session: AsyncSession = Depends(get_db_session)) -> AuthService:
+    return AuthService(session)
